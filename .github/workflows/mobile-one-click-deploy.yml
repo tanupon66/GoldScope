@@ -1,4 +1,4 @@
-name: GoldScope Mobile One-Click Deploy
+name: GoldScope Mobile One-Click Deploy (Hotfix 2)
 
 on:
   workflow_dispatch:
@@ -77,12 +77,13 @@ jobs:
           fi
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: หา Source หรือแตก Mobile Payload ZIP
         shell: bash
@@ -145,9 +146,20 @@ jobs:
       - name: Desktop and mobile E2E smoke test
         if: ${{ inputs.run_e2e }}
         shell: bash
+        env:
+          GOLDSCOPE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/goldscope-e2e-artifacts
         run: |
           cd "$PROJECT_DIR"
           npm run test:e2e
+
+      - name: Upload E2E screenshots and tuning fixture
+        if: ${{ always() && inputs.run_e2e }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: goldscope-e2e-${{ github.run_number }}
+          path: ${{ runner.temp }}/goldscope-e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: สร้างหรือใช้ D1/Queues เดิมและสร้าง config ชั่วคราว
         shell: bash
@@ -160,6 +172,33 @@ jobs:
             --database-name=goldscope-autotrade \
             --database-location="${{ inputs.database_location }}" \
             --app-version=3.2.1
+
+      - name: ตรวจ Durable Object bindings และ migrations ก่อน Deploy
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          node <<'NODE'
+          const { readFileSync } = require('node:fs');
+          const config = JSON.parse(readFileSync('.wrangler.mobile.generated.jsonc', 'utf8'));
+          const bindings = new Map((config.durable_objects?.bindings || []).map(item => [item.name, item.class_name]));
+          const requiredBindings = new Map([
+            ['AUTO_TRADE_STATE', 'AutoTradeState'],
+            ['AUTH_STATE', 'AuthState']
+          ]);
+          for (const [name, className] of requiredBindings) {
+            if (bindings.get(name) !== className) {
+              throw new Error(`Durable Object binding ไม่ครบ: ${name} -> ${className}`);
+            }
+          }
+          const migrations = config.migrations || [];
+          const migratedClasses = new Set(migrations.flatMap(item => item.new_sqlite_classes || []));
+          for (const className of requiredBindings.values()) {
+            if (!migratedClasses.has(className)) {
+              throw new Error(`Durable Object migration ไม่ครบ: ${className}`);
+            }
+          }
+          console.log('Durable Object config พร้อม: AUTO_TRADE_STATE, AUTH_STATE');
+          NODE
 
       - name: เตรียม Cloudflare Secrets แบบไม่แสดงค่า
         if: ${{ inputs.deployment_mode == 'first_install' }}
@@ -192,7 +231,9 @@ jobs:
         shell: bash
         run: |
           cd "$PROJECT_DIR"
-          npx wrangler deploy --config .wrangler.mobile.generated.jsonc --dry-run --strict
+          # ไม่ใช้ strict mode เพราะการติดตั้ง v3.2.1 ต้องเพิ่ม AUTH_STATE ให้ Worker เดิม
+          # ใน GitHub Actions โหมด non-interactive Wrangler จะใช้ config ใน repository เป็นแหล่งหลัก
+          npx wrangler deploy --config .wrangler.mobile.generated.jsonc --dry-run
 
       - name: Deploy ครั้งแรกพร้อม Secrets
         if: ${{ inputs.deployment_mode == 'first_install' }}
@@ -203,8 +244,7 @@ jobs:
             --config .wrangler.mobile.generated.jsonc \
             --secrets-file .mobile-secrets.json \
             --keep-vars \
-            --strict \
-            --message "GoldScope v3.2.1 mobile first install"
+            --message "GoldScope v3.2.1 mobile first install hotfix2"
 
       - name: Safe update โดยรักษา Secrets เดิม
         if: ${{ inputs.deployment_mode == 'safe_update' }}
@@ -214,8 +254,7 @@ jobs:
           npx wrangler deploy \
             --config .wrangler.mobile.generated.jsonc \
             --keep-vars \
-            --strict \
-            --message "GoldScope v3.2.1 mobile safe update"
+            --message "GoldScope v3.2.1 mobile safe update hotfix2"
 
       - name: สรุปผลติดตั้ง
         if: ${{ success() }}
